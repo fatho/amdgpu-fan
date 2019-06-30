@@ -2,6 +2,7 @@ use std::{thread, time};
 use std::path::{Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use log::{debug, info, warn, error};
 
 use serde_derive::Deserialize;
 use signal_hook;
@@ -11,9 +12,12 @@ mod control;
 use control::ControlCurve;
 
 fn main() {
+    env_logger::from_env(
+        env_logger::Env::default().default_filter_or("info")
+    ).init();
     match run() {
         Err(err) => {
-            println!("Error: {}", err);
+            error!("Exited with error: {}", err);
             std::process::exit(1)
         },
         Ok(_) => std::process::exit(0),
@@ -27,18 +31,18 @@ fn run() -> Result<(), Error> {
     ];
     let config = load_config(config_files.iter())?;
 
-    println!("Card: {}", config.control.card_path.display());
-    println!("Poll: {}ms", config.control.poll_interval_millis);
+    info!("Card: {}", config.control.card_path.display());
+    info!("Poll: {}ms", config.control.poll_interval_millis);
 
     let mut hwmons = amdgpu::Hwmon::for_device(config.control.card_path)?;
-    let mut device = hwmons.pop().expect("There should be at least one `hwmon` directory");
+    let mut device = hwmons.pop().ok_or(Error::CouldNotFindDevice)?;
 
     let exit = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::SIGTERM, Arc::clone(&exit))?;
     signal_hook::flag::register(signal_hook::SIGINT, Arc::clone(&exit))?;
 
-    println!("Enabling manual fan control");
     device.set_pwm_mode(amdgpu::PwmMode::Manual)?;
+    info!("Native fan control disabled");
 
     let curve = config.curve.to_curve();
     let poll_interval = time::Duration::from_millis(config.control.poll_interval_millis);
@@ -46,16 +50,15 @@ fn run() -> Result<(), Error> {
     let result = control_loop(&mut device, poll_interval, &curve, exit);
 
     if let Err(_) = &result {
-        println!("Control loop aborted");
+        info!("Control loop aborted");
     } else {
-        println!("Control loop stopped");
+        info!("Control loop stopped");
     }
 
     if let Err(err) = device.set_pwm_mode(amdgpu::PwmMode::Automatic) {
-        println!("CRITICAL: could not restore automatic fan control");
-        println!("{}", err);
+        error!("Could not restore native fan control: {}", err);
     } else {
-        println!("Automatic fan control restored");
+        info!("Native fan control restored");
     }
 
     result.map_err(Into::into)
@@ -67,7 +70,7 @@ fn control_loop(device: &mut amdgpu::Hwmon, poll_interval: time::Duration, curve
         let fan_speed_relative = curve.control(temperature_celcius);
         let fan_speed_pwm = amdgpu::Pwm::from_percentage(device.get_pwm_min(), device.get_pwm_max(), fan_speed_relative)?;
 
-        println!("T_cur={: >5.1}°C\tV_rel={: >5.1}%\tV_pwm={: >3}", temperature_celcius, fan_speed_relative * 100.0, fan_speed_pwm.as_raw());
+        debug!("T_cur={: >5.1}°C\tV_rel={: >5.1}%\tV_pwm={: >3}", temperature_celcius, fan_speed_relative * 100.0, fan_speed_pwm.as_raw());
 
         device.set_pwm(fan_speed_pwm)?;
 
@@ -82,6 +85,7 @@ pub enum Error {
     Control(amdgpu::GpuError),
     ConfigurationMissing,
     InvalidCurve,
+    CouldNotFindDevice,
 }
 
 impl From<std::io::Error> for Error {
@@ -110,6 +114,7 @@ impl std::fmt::Display for Error {
             &Error::Control(err) => write!(f, "{}", err),
             &Error::InvalidCurve => write!(f, "Curve definition must contain at least one entry, and an equal number of temperatures and fan speeds."),
             &Error::ConfigurationMissing => write!(f, "No valid configuration file found"),
+            &Error::CouldNotFindDevice => write!(f, "No HWMON entry found for the selected card"),
         }
     }
 }
@@ -153,11 +158,15 @@ fn load_config<I, P>(paths_to_check: I) -> Result<Config, Error> where
     })
     .find_map(|(path, cfg)| match cfg {
         Ok(cfg) => {
-            println!("{}: loaded", path.as_ref().display());
+            info!("{}: loaded", path.as_ref().display());
             Some(cfg)
         },
-        Err(no_cfg) => {
-            println!("{}: {}", path.as_ref().display(), no_cfg);
+        Err(Error::ConfigIo(ref io_err)) if io_err.kind() == std::io::ErrorKind::NotFound => {
+            info!("{}: {}", path.as_ref().display(), io_err);
+            None
+        },
+        Err(cfg_err) => {
+            warn!("{}: {}", path.as_ref().display(), cfg_err);
             None
         }
     })
