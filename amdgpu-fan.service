@@ -1,0 +1,11 @@
+[Unit]
+Description="Autmatic fan control for the AMD GPU driver"
+
+[Install]
+WantedBy=multi-user.target
+
+[Service]
+ExecStart=/usr/bin/amdgpu-fan
+# A crude way to have the unit restart after sleeping which often (always?)
+# makes setting the fan speed fail.
+Restart=on-failure
